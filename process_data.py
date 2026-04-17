@@ -2,8 +2,8 @@
 Data processing pipeline for tool wear prediction.
 
 Reads raw force/torque (.txt), vibration/sound (.csv/.xlsx), and tool wear (.xls),
-extracts statistical features from the time-series data, averages Vbmax per cycle,
-and saves an 80/20 train/test split to processed_data/.
+extracts statistical features from the time-series data using a sliding window
+approach, averages Vbmax per cycle, and saves an 80/20 train/test split.
 """
 
 import os
@@ -27,6 +27,7 @@ VIB_DIR = RAW_DIR / "Vibration and sound data"
 OUT_DIR = PROJECT_ROOT / "processed_data"
 
 RANDOM_SEED = 42
+NUM_WINDOWS = 10
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -42,37 +43,48 @@ def normalize_id(filename: str) -> str:
 
 def extract_time_domain_features(signal: np.ndarray) -> dict:
     """Compute time-domain statistical features for a 1-D signal."""
+    rms = np.sqrt(np.mean(signal ** 2))
+    peak = max(abs(signal.max()), abs(signal.min()))
+    crest_factor = peak / rms if rms > 0 else 0.0
+    mean_cross = np.sum(np.diff(np.sign(signal - np.mean(signal))) != 0)
+    zcr = mean_cross / len(signal) if len(signal) > 0 else 0.0
+
     return {
         "mean": np.mean(signal),
         "std": np.std(signal, ddof=1) if len(signal) > 1 else 0.0,
         "max": np.max(signal),
         "min": np.min(signal),
-        "rms": np.sqrt(np.mean(signal ** 2)),
+        "rms": rms,
         "kurtosis": float(stats.kurtosis(signal, fisher=True)),
         "skewness": float(stats.skew(signal)),
+        "peak_to_peak": float(np.ptp(signal)),
+        "crest_factor": crest_factor,
+        "zcr": zcr,
+        "p25": float(np.percentile(signal, 25)),
+        "p75": float(np.percentile(signal, 75)),
     }
 
 
 def extract_freq_domain_features(signal: np.ndarray, fs: float = 10000.0) -> dict:
-    """Compute frequency-domain features via FFT."""
+    """Compute frequency-domain features via FFT (normalized by signal length)."""
     n = len(signal)
     yf = np.abs(rfft(signal))
     xf = rfftfreq(n, d=1.0 / fs)
 
-    # ignore DC component
     yf = yf[1:]
     xf = xf[1:]
 
     if len(yf) == 0:
-        return {"dominant_freq": 0.0, "spectral_energy": 0.0, "mean_freq": 0.0}
+        return {"dominant_freq": 0.0, "mean_spectral_energy": 0.0, "mean_freq": 0.0}
 
-    spectral_energy = np.sum(yf ** 2)
+    mean_spectral_energy = float(np.mean(yf ** 2))
     dominant_freq = float(xf[np.argmax(yf)])
-    mean_freq = float(np.sum(xf * yf) / np.sum(yf)) if np.sum(yf) > 0 else 0.0
+    yf_sum = np.sum(yf)
+    mean_freq = float(np.sum(xf * yf) / yf_sum) if yf_sum > 0 else 0.0
 
     return {
         "dominant_freq": dominant_freq,
-        "spectral_energy": spectral_energy,
+        "mean_spectral_energy": mean_spectral_energy,
         "mean_freq": mean_freq,
     }
 
@@ -101,17 +113,17 @@ def read_xlsx_numeric_columns(path: pathlib.Path) -> np.ndarray:
                     if elem.tag != f"{NS}row":
                         continue
                     row_num = int(elem.get("r", "0"))
-                    if row_num <= 1:          # skip header
+                    if row_num <= 1:
                         elem.clear()
                         continue
                     vals = [np.nan] * 4
                     for c in elem:
                         if c.tag != f"{NS}c":
                             continue
-                        ref = c.get("r", "")   # e.g. "B2", "C2"
+                        ref = c.get("r", "")
                         if not ref or ref[0] not in "BCDE":
                             continue
-                        if c.get("t") == "s":  # shared-string cell, skip
+                        if c.get("t") == "s":
                             continue
                         v_elem = c.find(f"{NS}v")
                         if v_elem is not None and v_elem.text:
@@ -132,9 +144,6 @@ def load_tool_wear() -> pd.Series:
     """Return a Series mapping cycle number (int) -> average Vbmax (float)."""
     df = pd.read_excel(TOOL_WEAR_PATH, engine="xlrd", header=None)
 
-    # Data rows start at index 4; column 0 is the cycle number.
-    # Vbmax columns (0-indexed): side teeth edges 1-4 at cols 1,4,7,10;
-    # end teeth edges 1-4 at cols 13,15,17,19.
     vbmax_cols = [1, 4, 7, 10, 13, 15, 17, 19]
     data = df.iloc[4:].copy()
     data.columns = range(data.shape[1])
@@ -172,34 +181,70 @@ def build_cycle_map() -> list[dict]:
     return cycle_map
 
 
-# ─── step 3: extract features from one cycle ────────────────────────────────
-def extract_features_for_cycle(entry: dict) -> dict:
-    """Read force/torque + vibration/sound files and return a flat feature dict."""
-    features = {}
+# ─── step 3: load raw signals for one cycle ─────────────────────────────────
+def load_raw_signals(entry: dict) -> dict[str, np.ndarray]:
+    """Return a dict of channel_name -> 1-D numpy array for one cycle."""
+    signals = {}
 
-    # --- force / torque ---
     ft_path = FORCE_DIR / entry["force_file"]
     ft_df = pd.read_csv(ft_path, sep="\t")
     for col in ["Fx", "Fy", "Fz", "Mz"]:
-        features.update(extract_channel_features(ft_df[col].values, col))
+        signals[col] = ft_df[col].values
 
-    # --- vibration / sound ---
     vib_path = VIB_DIR / entry["vib_file"]
     channel_names = ["accel_x", "accel_y", "accel_z", "sound"]
     if vib_path.suffix == ".xlsx":
         vib_data = read_xlsx_numeric_columns(vib_path)
         for col_idx, name in enumerate(channel_names):
-            features.update(extract_channel_features(vib_data[:, col_idx], name))
+            signals[name] = vib_data[:, col_idx]
     else:
-        vib_df = pd.read_csv(
-            vib_path, encoding="latin-1", on_bad_lines="skip"
-        )
+        vib_df = pd.read_csv(vib_path, encoding="latin-1", on_bad_lines="skip")
         for col_idx, name in enumerate(channel_names):
             col_data = pd.to_numeric(vib_df.iloc[:, col_idx + 1], errors="coerce")
-            col_data = col_data.dropna().values
-            features.update(extract_channel_features(col_data, name))
+            signals[name] = col_data.dropna().values
 
-    return features
+    return signals
+
+
+def detect_cutting_region(signals: dict[str, np.ndarray]) -> tuple[int, int]:
+    """Detect the active cutting region using Fz (axial force).
+
+    Computes a 1-second rolling RMS of Fz and marks regions where
+    it exceeds 5% of the peak RMS as active cutting."""
+    fz = signals["Fz"]
+    window = min(10000, len(fz) // 4)
+    rms = np.sqrt(np.convolve(fz ** 2, np.ones(window) / window, mode="same"))
+    threshold = rms.max() * 0.05
+    active = np.where(rms > threshold)[0]
+    if len(active) == 0:
+        return 0, len(fz)
+    return int(active[0]), int(active[-1]) + 1
+
+
+def extract_windowed_features(signals: dict[str, np.ndarray],
+                              num_windows: int) -> list[dict]:
+    """Trim to the active cutting region, then split into num_windows equal
+    segments and extract features from each window."""
+    cut_start, cut_end = detect_cutting_region(signals)
+    trimmed = {k: v[cut_start:cut_end] for k, v in signals.items()}
+
+    min_len = min(len(s) for s in trimmed.values())
+    window_size = min_len // num_windows
+    if window_size < 100:
+        num_windows = max(1, min_len // 100)
+        window_size = min_len // num_windows
+
+    window_rows = []
+    for w in range(num_windows):
+        start = w * window_size
+        end = start + window_size
+        features = {"window": w}
+        for ch_name, full_signal in trimmed.items():
+            seg = full_signal[start:end]
+            features.update(extract_channel_features(seg, ch_name))
+        window_rows.append(features)
+
+    return window_rows
 
 
 # ─── step 4 & 5: build dataset, split, and save ─────────────────────────────
@@ -210,32 +255,45 @@ def main():
     print("Step 2: Building file-to-cycle map...")
     cycle_map = build_cycle_map()
 
-    print("Step 3: Extracting features (this may take several minutes)...")
-    rows = []
+    print(f"Step 3: Extracting windowed features ({NUM_WINDOWS} windows/cycle)...")
+    all_rows = []
     for i, entry in enumerate(cycle_map):
         cycle = entry["cycle"]
         if cycle not in vbmax.index:
             print(f"  WARNING: cycle {cycle} not found in tool wear data, skipping")
             continue
-        features = extract_features_for_cycle(entry)
-        features["cycle"] = cycle
-        features["avg_vbmax"] = vbmax[cycle]
-        rows.append(features)
-        print(f"  [{i + 1}/{len(cycle_map)}] Cycle {cycle} ({entry['id']}) done")
 
-    df = pd.DataFrame(rows)
-    feature_cols = [c for c in df.columns if c not in ("cycle", "avg_vbmax")]
+        signals = load_raw_signals(entry)
+        cut_start, cut_end = detect_cutting_region(signals)
+        total_len = len(signals["Fz"])
+        cut_pct = (cut_end - cut_start) / total_len * 100
+
+        window_rows = extract_windowed_features(signals, NUM_WINDOWS)
+
+        for row in window_rows:
+            row["cycle"] = cycle
+            row["avg_vbmax"] = vbmax[cycle]
+            all_rows.append(row)
+
+        print(f"  [{i + 1}/{len(cycle_map)}] Cycle {cycle} ({entry['id']}) "
+              f"-> {len(window_rows)} windows "
+              f"(cutting: {cut_pct:.0f}%, trimmed {cut_start/10000:.1f}s idle)")
+
+    df = pd.DataFrame(all_rows)
+    feature_cols = [c for c in df.columns
+                    if c not in ("cycle", "avg_vbmax", "window")]
     print(f"\n  Total samples: {len(df)}, features per sample: {len(feature_cols)}")
 
-    # ── 80 / 20 split ──
+    # ── 80/20 split at the CYCLE level to prevent data leakage ──
     random.seed(RANDOM_SEED)
-    indices = list(range(len(df)))
-    random.shuffle(indices)
-    split = int(0.8 * len(indices))
-    train_idx, test_idx = indices[:split], indices[split:]
+    unique_cycles = df["cycle"].unique().tolist()
+    random.shuffle(unique_cycles)
+    split = int(0.8 * len(unique_cycles))
+    train_cycles = set(unique_cycles[:split])
+    test_cycles = set(unique_cycles[split:])
 
-    train_df = df.iloc[train_idx].reset_index(drop=True)
-    test_df = df.iloc[test_idx].reset_index(drop=True)
+    train_df = df[df["cycle"].isin(train_cycles)].reset_index(drop=True)
+    test_df = df[df["cycle"].isin(test_cycles)].reset_index(drop=True)
 
     # ── save ──
     train_dir = OUT_DIR / "train"
@@ -248,7 +306,8 @@ def main():
     test_df[feature_cols].to_csv(test_dir / "test_features.csv", index=False)
     test_df[["avg_vbmax"]].to_csv(test_dir / "test_labels.csv", index=False)
 
-    print(f"\nDone!  Train: {len(train_df)} samples  |  Test: {len(test_df)} samples")
+    print(f"\nDone!  Train: {len(train_df)} samples ({len(train_cycles)} cycles)  "
+          f"|  Test: {len(test_df)} samples ({len(test_cycles)} cycles)")
     print(f"  Saved to {OUT_DIR.relative_to(PROJECT_ROOT)}/")
 
 

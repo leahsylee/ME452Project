@@ -2,7 +2,8 @@
 Train an MLP to predict tool wear (Vbmax) from extracted features.
 
 Reads processed CSV files from processed_data/train/ and processed_data/test/,
-normalises features, trains a small fully-connected network, and reports metrics.
+normalises features, trains a fully-connected network with early stopping,
+and reports metrics.
 """
 
 import pathlib
@@ -27,7 +28,7 @@ RANDOM_SEED = 42
 
 # ─── data loading ────────────────────────────────────────────────────────────
 def load_data():
-    """Load train/test CSVs and return normalised tensors + scaler params."""
+    """Load train/test CSVs and return normalised tensors."""
     train_x = np.loadtxt(TRAIN_DIR / "train_features.csv", delimiter=",", skiprows=1)
     train_y = np.loadtxt(TRAIN_DIR / "train_labels.csv", delimiter=",", skiprows=1)
     test_x = np.loadtxt(TEST_DIR / "test_features.csv", delimiter=",", skiprows=1)
@@ -35,16 +36,6 @@ def load_data():
 
     train_y = train_y.reshape(-1, 1)
     test_y = test_y.reshape(-1, 1)
-
-    # Log-transform columns with extreme dynamic range (e.g. spectral_energy)
-    # before z-score normalization to prevent overflow
-    for col in range(train_x.shape[1]):
-        col_max = np.abs(train_x[:, col]).max()
-        if col_max > 1e6:
-            sign_tr = np.sign(train_x[:, col])
-            sign_te = np.sign(test_x[:, col])
-            train_x[:, col] = sign_tr * np.log1p(np.abs(train_x[:, col]))
-            test_x[:, col] = sign_te * np.log1p(np.abs(test_x[:, col]))
 
     # z-score normalisation fitted on training set only
     mu = train_x.mean(axis=0)
@@ -54,7 +45,6 @@ def load_data():
     train_x = (train_x - mu) / sigma
     test_x = (test_x - mu) / sigma
 
-    # Clip to prevent extreme outliers from causing NaN
     train_x = np.clip(train_x, -10, 10)
     test_x = np.clip(test_x, -10, 10)
 
@@ -71,13 +61,15 @@ class ToolWearMLP(nn.Module):
     def __init__(self, input_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(input_dim, 64),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
+            nn.Dropout(0.3),
+            nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 1),
+            nn.Dropout(0.3),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
         )
 
     def forward(self, x):
@@ -85,7 +77,7 @@ class ToolWearMLP(nn.Module):
 
 
 # ─── training loop ───────────────────────────────────────────────────────────
-def train(model, loader, criterion, optimizer):
+def train_epoch(model, loader, criterion, optimizer):
     model.train()
     total_loss = 0.0
     for xb, yb in loader:
@@ -132,32 +124,55 @@ def main():
 
     train_ds = TensorDataset(train_x, train_y)
     test_ds = TensorDataset(test_x, test_y)
-    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
+    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
     test_loader = DataLoader(test_ds, batch_size=len(test_ds))
 
     model = ToolWearMLP(input_dim=train_x.shape[1]).to(DEVICE)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-4)
 
-    num_epochs = 500
+    num_epochs = 3000
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=1e-7
+    )
+
     train_losses, test_losses = [], []
+    best_test_rmse = float("inf")
+    best_state = None
+    patience = 300
+    epochs_no_improve = 0
 
-    print(f"\nTraining for {num_epochs} epochs on {DEVICE}...")
+    print(f"\nTraining for up to {num_epochs} epochs on {DEVICE}...")
     for epoch in range(1, num_epochs + 1):
-        t_loss = train(model, train_loader, criterion, optimizer)
-        _, _, _, _, _ = evaluate(model, train_loader, criterion)
+        t_loss = train_epoch(model, train_loader, criterion, optimizer)
         te_mse, te_rmse, te_r2, _, _ = evaluate(model, test_loader, criterion)
         scheduler.step()
 
         train_losses.append(t_loss)
         test_losses.append(te_mse)
 
-        if epoch % 50 == 0 or epoch == 1:
-            print(f"  Epoch {epoch:>4d}  |  Train MSE: {t_loss:.6f}  |  "
-                  f"Test RMSE: {te_rmse:.4f}  |  Test R²: {te_r2:.4f}")
+        # Early stopping: save best model, stop if no improvement
+        if te_rmse < best_test_rmse:
+            best_test_rmse = te_rmse
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
-    # ── final evaluation ──
+        if epoch % 100 == 0 or epoch == 1:
+            lr_now = scheduler.get_last_lr()[0]
+            print(f"  Epoch {epoch:>4d}  |  Train MSE: {t_loss:.6f}  |  "
+                  f"Test RMSE: {te_rmse:.4f}  |  Test R²: {te_r2:.4f}  |  "
+                  f"LR: {lr_now:.2e}")
+
+        if epochs_no_improve >= patience:
+            print(f"\n  Early stopping at epoch {epoch} "
+                  f"(no improvement for {patience} epochs)")
+            break
+
+    # Restore best model
+    if best_state is not None:
+        model.load_state_dict(best_state)
     _, final_rmse, final_r2, preds, targets = evaluate(model, test_loader, criterion)
 
     print(f"\n{'='*60}")
@@ -178,14 +193,13 @@ def main():
     # ── loss curve plot ──
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    axes[0].plot(train_losses, label="Train MSE")
-    axes[0].plot(test_losses, label="Test MSE")
+    axes[0].plot(train_losses, label="Train MSE", alpha=0.8)
+    axes[0].plot(test_losses, label="Test MSE", alpha=0.8)
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("MSE")
     axes[0].set_title("Training & Test Loss")
     axes[0].legend()
 
-    # ── predicted vs actual scatter ──
     axes[1].scatter(targets, preds, alpha=0.7, edgecolors="k", linewidths=0.5)
     lo = min(targets.min(), preds.min()) * 0.9
     hi = max(targets.max(), preds.max()) * 1.1
@@ -200,7 +214,6 @@ def main():
     fig.savefig(PROJECT_ROOT / "results.png", dpi=150)
     print(f"\nPlot saved to results.png")
 
-    # ── save model ──
     torch.save(model.state_dict(), PROJECT_ROOT / "model.pth")
     print(f"Model saved to model.pth")
 
