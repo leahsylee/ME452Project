@@ -20,14 +20,14 @@ from scipy.fft import rfft, rfftfreq
 
 # ─── paths ───────────────────────────────────────────────────────────────────
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
-RAW_DIR = PROJECT_ROOT / "raw_data"
+RAW_DIR = PROJECT_ROOT / "raw_data" / "Milling dataset from QIT"
 TOOL_WEAR_PATH = RAW_DIR / "tool wear.xls"
 FORCE_DIR = RAW_DIR / "Force and torque data"
 VIB_DIR = RAW_DIR / "Vibration and sound data"
 OUT_DIR = PROJECT_ROOT / "processed_data"
 
 RANDOM_SEED = 42
-NUM_WINDOWS = 10
+NUM_WINDOWS = 20
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -43,30 +43,21 @@ def normalize_id(filename: str) -> str:
 
 def extract_time_domain_features(signal: np.ndarray) -> dict:
     """Compute time-domain statistical features for a 1-D signal."""
-    rms = np.sqrt(np.mean(signal ** 2))
-    peak = max(abs(signal.max()), abs(signal.min()))
-    crest_factor = peak / rms if rms > 0 else 0.0
-    mean_cross = np.sum(np.diff(np.sign(signal - np.mean(signal))) != 0)
-    zcr = mean_cross / len(signal) if len(signal) > 0 else 0.0
-
     return {
         "mean": np.mean(signal),
         "std": np.std(signal, ddof=1) if len(signal) > 1 else 0.0,
         "max": np.max(signal),
         "min": np.min(signal),
-        "rms": rms,
         "kurtosis": float(stats.kurtosis(signal, fisher=True)),
         "skewness": float(stats.skew(signal)),
         "peak_to_peak": float(np.ptp(signal)),
-        "crest_factor": crest_factor,
-        "zcr": zcr,
         "p25": float(np.percentile(signal, 25)),
         "p75": float(np.percentile(signal, 75)),
     }
 
 
-def extract_freq_domain_features(signal: np.ndarray, fs: float = 10000.0) -> dict:
-    """Compute frequency-domain features via FFT (normalized by signal length)."""
+def extract_mean_frequency(signal: np.ndarray, fs: float = 10000.0) -> dict:
+    """Compute the mean (weighted-average) frequency via FFT."""
     n = len(signal)
     yf = np.abs(rfft(signal))
     xf = rfftfreq(n, d=1.0 / fs)
@@ -75,24 +66,18 @@ def extract_freq_domain_features(signal: np.ndarray, fs: float = 10000.0) -> dic
     xf = xf[1:]
 
     if len(yf) == 0:
-        return {"dominant_freq": 0.0, "mean_spectral_energy": 0.0, "mean_freq": 0.0}
+        return {"mean_freq": 0.0}
 
-    mean_spectral_energy = float(np.mean(yf ** 2))
-    dominant_freq = float(xf[np.argmax(yf)])
     yf_sum = np.sum(yf)
     mean_freq = float(np.sum(xf * yf) / yf_sum) if yf_sum > 0 else 0.0
 
-    return {
-        "dominant_freq": dominant_freq,
-        "mean_spectral_energy": mean_spectral_energy,
-        "mean_freq": mean_freq,
-    }
+    return {"mean_freq": mean_freq}
 
 
 def extract_channel_features(signal: np.ndarray, channel_name: str) -> dict:
-    """Full feature set (time + freq) for one signal channel."""
+    """Full feature set (time-domain + mean frequency) for one signal channel."""
     td = extract_time_domain_features(signal)
-    fd = extract_freq_domain_features(signal)
+    fd = extract_mean_frequency(signal)
     return {f"{channel_name}_{k}": v for k, v in {**td, **fd}.items()}
 
 
@@ -144,7 +129,7 @@ def load_tool_wear() -> pd.Series:
     """Return a Series mapping cycle number (int) -> average Vbmax (float)."""
     df = pd.read_excel(TOOL_WEAR_PATH, engine="xlrd", header=None)
 
-    vbmax_cols = [1, 4, 7, 10, 13, 15, 17, 19]
+    vbmax_cols = [1, 4, 7, 10]
     data = df.iloc[4:].copy()
     data.columns = range(data.shape[1])
 
@@ -182,16 +167,21 @@ def build_cycle_map() -> list[dict]:
 
 
 # ─── step 3: load raw signals for one cycle ─────────────────────────────────
-def load_raw_signals(entry: dict) -> dict[str, np.ndarray]:
-    """Return a dict of channel_name -> 1-D numpy array for one cycle."""
+def load_raw_signals(entry: dict) -> dict[str, np.ndarray] | None:
+    """Return a dict of channel_name -> 1-D numpy array for one cycle,
+    or None if a file is empty/corrupt."""
     signals = {}
 
     ft_path = FORCE_DIR / entry["force_file"]
+    if ft_path.stat().st_size == 0:
+        return None
     ft_df = pd.read_csv(ft_path, sep="\t")
     for col in ["Fx", "Fy", "Fz", "Mz"]:
         signals[col] = ft_df[col].values
 
     vib_path = VIB_DIR / entry["vib_file"]
+    if vib_path.stat().st_size == 0:
+        return None
     channel_names = ["accel_x", "accel_y", "accel_z", "sound"]
     if vib_path.suffix == ".xlsx":
         vib_data = read_xlsx_numeric_columns(vib_path)
@@ -264,6 +254,11 @@ def main():
             continue
 
         signals = load_raw_signals(entry)
+        if signals is None:
+            print(f"  [{i + 1}/{len(cycle_map)}] Cycle {cycle} ({entry['id']}) "
+                  f"-> SKIPPED (empty file)")
+            continue
+
         cut_start, cut_end = detect_cutting_region(signals)
         total_len = len(signals["Fz"])
         cut_pct = (cut_end - cut_start) / total_len * 100

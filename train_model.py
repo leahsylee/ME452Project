@@ -2,8 +2,7 @@
 Train an MLP to predict tool wear (Vbmax) from extracted features.
 
 Reads processed CSV files from processed_data/train/ and processed_data/test/,
-normalises features, trains a fully-connected network with early stopping,
-and reports metrics.
+trains a fully-connected network, and reports metrics.
 """
 
 import pathlib
@@ -28,7 +27,7 @@ RANDOM_SEED = 42
 
 # ─── data loading ────────────────────────────────────────────────────────────
 def load_data():
-    """Load train/test CSVs and return normalised tensors."""
+    """Load train/test CSVs and return z-score normalised tensors."""
     train_x = np.loadtxt(TRAIN_DIR / "train_features.csv", delimiter=",", skiprows=1)
     train_y = np.loadtxt(TRAIN_DIR / "train_labels.csv", delimiter=",", skiprows=1)
     test_x = np.loadtxt(TEST_DIR / "test_features.csv", delimiter=",", skiprows=1)
@@ -37,14 +36,11 @@ def load_data():
     train_y = train_y.reshape(-1, 1)
     test_y = test_y.reshape(-1, 1)
 
-    # z-score normalisation fitted on training set only
     mu = train_x.mean(axis=0)
     sigma = train_x.std(axis=0)
     sigma[sigma == 0] = 1.0
-
     train_x = (train_x - mu) / sigma
     test_x = (test_x - mu) / sigma
-
     train_x = np.clip(train_x, -10, 10)
     test_x = np.clip(test_x, -10, 10)
 
@@ -63,10 +59,8 @@ class ToolWearMLP(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.ReLU(),
-            nn.Dropout(0.3),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Dropout(0.3),
             nn.Linear(32, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
@@ -131,18 +125,14 @@ def main():
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-4)
 
-    num_epochs = 3000
+    num_epochs = 200
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=num_epochs, eta_min=1e-7
     )
 
     train_losses, test_losses = [], []
-    best_test_rmse = float("inf")
-    best_state = None
-    patience = 300
-    epochs_no_improve = 0
 
-    print(f"\nTraining for up to {num_epochs} epochs on {DEVICE}...")
+    print(f"\nTraining for {num_epochs} epochs on {DEVICE}...")
     for epoch in range(1, num_epochs + 1):
         t_loss = train_epoch(model, train_loader, criterion, optimizer)
         te_mse, te_rmse, te_r2, _, _ = evaluate(model, test_loader, criterion)
@@ -151,42 +141,25 @@ def main():
         train_losses.append(t_loss)
         test_losses.append(te_mse)
 
-        # Early stopping: save best model, stop if no improvement
-        if te_rmse < best_test_rmse:
-            best_test_rmse = te_rmse
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-
-        if epoch % 100 == 0 or epoch == 1:
+        if epoch % 20 == 0 or epoch == 1:
             lr_now = scheduler.get_last_lr()[0]
             print(f"  Epoch {epoch:>4d}  |  Train MSE: {t_loss:.6f}  |  "
                   f"Test RMSE: {te_rmse:.4f}  |  Test R²: {te_r2:.4f}  |  "
                   f"LR: {lr_now:.2e}")
 
-        if epochs_no_improve >= patience:
-            print(f"\n  Early stopping at epoch {epoch} "
-                  f"(no improvement for {patience} epochs)")
-            break
-
-    # Restore best model
-    if best_state is not None:
-        model.load_state_dict(best_state)
     _, final_rmse, final_r2, preds, targets = evaluate(model, test_loader, criterion)
 
     print(f"\n{'='*60}")
-    print(f"  {'Sample':>6}  {'Predicted':>10}  {'Actual':>10}  {'Accuracy':>10}")
+    print(f"  {'Sample':>6}  {'Predicted':>10}  {'Actual':>10}  {'Loss (mm)':>10}")
     print(f"  {'-'*42}")
-    accuracies = []
+    losses = []
     for i in range(len(targets)):
-        pct_err = abs(preds[i] - targets[i]) / targets[i] * 100
-        accuracy = 100.0 - pct_err
-        accuracies.append(accuracy)
-        print(f"  {i+1:>6}  {preds[i]:>10.4f}  {targets[i]:>10.4f}  {accuracy:>9.2f}%")
-    mean_accuracy = np.mean(accuracies)
+        loss_val = targets[i] - preds[i]
+        losses.append(loss_val)
+        print(f"  {i+1:>6}  {preds[i]:>10.4f}  {targets[i]:>10.4f}  {loss_val:>+10.4f}")
+    mean_abs_loss = np.mean(np.abs(losses))
     print(f"  {'-'*42}")
-    print(f"  Mean accuracy: {mean_accuracy:.2f}%")
+    print(f"  Mean absolute loss: {mean_abs_loss:.4f} mm")
     print(f"  RMSE: {final_rmse:.4f} mm  |  R²: {final_r2:.4f}")
     print(f"{'='*60}")
 
