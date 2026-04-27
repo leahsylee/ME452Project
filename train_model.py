@@ -1,10 +1,3 @@
-"""
-Train an MLP to predict tool wear (Vbmax) from extracted features.
-
-Reads processed CSV files from processed_data/train/ and processed_data/test/,
-trains a fully-connected network, and reports metrics.
-"""
-
 import pathlib
 
 import numpy as np
@@ -15,7 +8,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-# ─── paths ───────────────────────────────────────────────────────────────────
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "processed_data"
 TRAIN_DIR = DATA_DIR / "train"
@@ -25,9 +17,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 RANDOM_SEED = 42
 
 
-# ─── data loading ────────────────────────────────────────────────────────────
 def load_data():
-    """Load train/test CSVs and return z-score normalised tensors."""
     train_x = np.loadtxt(TRAIN_DIR / "train_features.csv", delimiter=",", skiprows=1)
     train_y = np.loadtxt(TRAIN_DIR / "train_labels.csv", delimiter=",", skiprows=1)
     test_x = np.loadtxt(TEST_DIR / "test_features.csv", delimiter=",", skiprows=1)
@@ -36,6 +26,7 @@ def load_data():
     train_y = train_y.reshape(-1, 1)
     test_y = test_y.reshape(-1, 1)
 
+    # z-score normalization
     mu = train_x.mean(axis=0)
     sigma = train_x.std(axis=0)
     sigma[sigma == 0] = 1.0
@@ -52,9 +43,8 @@ def load_data():
     )
 
 
-# ─── model ───────────────────────────────────────────────────────────────────
 class ToolWearMLP(nn.Module):
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 64),
@@ -70,7 +60,6 @@ class ToolWearMLP(nn.Module):
         return self.net(x)
 
 
-# ─── training loop ───────────────────────────────────────────────────────────
 def train_epoch(model, loader, criterion, optimizer):
     model.train()
     total_loss = 0.0
@@ -106,7 +95,6 @@ def evaluate(model, loader, criterion):
     return mse, rmse, r2, preds, targets
 
 
-# ─── main ────────────────────────────────────────────────────────────────────
 def main():
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
@@ -163,7 +151,6 @@ def main():
     print(f"  RMSE: {final_rmse:.4f} mm  |  R²: {final_r2:.4f}")
     print(f"{'='*60}")
 
-    # ── loss curve plot ──
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
     axes[0].plot(train_losses, label="Train MSE", alpha=0.8)

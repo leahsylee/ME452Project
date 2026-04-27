@@ -1,11 +1,3 @@
-"""
-Data processing pipeline for tool wear prediction.
-
-Reads raw force/torque (.txt), vibration/sound (.csv/.xlsx), and tool wear (.xls),
-extracts statistical features from the time-series data using a sliding window
-approach, averages Vbmax per cycle, and saves an 80/20 train/test split.
-"""
-
 import os
 import re
 import random
@@ -18,7 +10,6 @@ import pandas as pd
 from scipy import stats
 from scipy.fft import rfft, rfftfreq
 
-# ─── paths ───────────────────────────────────────────────────────────────────
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 RAW_DIR = PROJECT_ROOT / "raw_data" / "Milling dataset from QIT"
 TOOL_WEAR_PATH = RAW_DIR / "tool wear.xls"
@@ -30,10 +21,7 @@ RANDOM_SEED = 42
 NUM_WINDOWS = 20
 
 
-# ─── helpers ─────────────────────────────────────────────────────────────────
-def normalize_id(filename: str) -> str:
-    """Extract a canonical 'MM-DD-N' id from a filename, stripping extensions
-    and leading zeros on the run number so that '01-26-01' == '01-26-1'."""
+def normalize_id(filename):
     stem = pathlib.Path(filename).stem
     m = re.match(r"(\d{2})-(\d{2})-0*(\d+)", stem)
     if not m:
@@ -41,8 +29,7 @@ def normalize_id(filename: str) -> str:
     return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
 
 
-def extract_time_domain_features(signal: np.ndarray) -> dict:
-    """Compute time-domain statistical features for a 1-D signal."""
+def extract_time_domain_features(signal):
     return {
         "mean": np.mean(signal),
         "std": np.std(signal, ddof=1) if len(signal) > 1 else 0.0,
@@ -56,8 +43,7 @@ def extract_time_domain_features(signal: np.ndarray) -> dict:
     }
 
 
-def extract_mean_frequency(signal: np.ndarray, fs: float = 10000.0) -> dict:
-    """Compute the mean (weighted-average) frequency via FFT."""
+def extract_mean_frequency(signal, fs=10000.0):
     n = len(signal)
     yf = np.abs(rfft(signal))
     xf = rfftfreq(n, d=1.0 / fs)
@@ -70,12 +56,10 @@ def extract_mean_frequency(signal: np.ndarray, fs: float = 10000.0) -> dict:
 
     yf_sum = np.sum(yf)
     mean_freq = float(np.sum(xf * yf) / yf_sum) if yf_sum > 0 else 0.0
-
     return {"mean_freq": mean_freq}
 
 
-def extract_channel_features(signal: np.ndarray, channel_name: str) -> dict:
-    """Full feature set (time-domain + mean frequency) for one signal channel."""
+def extract_channel_features(signal, channel_name):
     td = extract_time_domain_features(signal)
     fd = extract_mean_frequency(signal)
     return {f"{channel_name}_{k}": v for k, v in {**td, **fd}.items()}
@@ -84,13 +68,9 @@ def extract_channel_features(signal: np.ndarray, channel_name: str) -> dict:
 NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
 
-def read_xlsx_numeric_columns(path: pathlib.Path) -> np.ndarray:
-    """Stream-parse a large .xlsx and return columns B-E as a float array.
-
-    Bypasses the shared-strings table entirely (we only need numeric cells).
-    Returns shape (n_rows, 4) for the 4 sensor channels.
-    Tolerates truncated/corrupted XML by returning data collected so far."""
-    rows: list[list[float]] = []
+def read_xlsx_numeric_columns(path):
+    """Stream-parse .xlsx to get columns B-E as floats (bypasses shared strings)."""
+    rows = []
     with zipfile.ZipFile(path) as zf:
         with zf.open("xl/worksheets/sheet.xml") as f:
             try:
@@ -124,9 +104,7 @@ def read_xlsx_numeric_columns(path: pathlib.Path) -> np.ndarray:
     return arr[mask]
 
 
-# ─── step 1: load tool wear labels ──────────────────────────────────────────
-def load_tool_wear() -> pd.Series:
-    """Return a Series mapping cycle number (int) -> average Vbmax (float)."""
+def load_tool_wear():
     df = pd.read_excel(TOOL_WEAR_PATH, engine="xlrd", header=None)
 
     vbmax_cols = [1, 4, 7, 10]
@@ -143,10 +121,7 @@ def load_tool_wear() -> pd.Series:
     return result
 
 
-# ─── step 2: match files to cycles ──────────────────────────────────────────
-def build_cycle_map() -> list[dict]:
-    """Return a list of dicts sorted by cycle order, each containing:
-    cycle, force_file, vib_file."""
+def build_cycle_map():
     force_files = {normalize_id(f): f for f in os.listdir(FORCE_DIR)}
     vib_files = {normalize_id(f): f for f in os.listdir(VIB_DIR)}
 
@@ -166,10 +141,7 @@ def build_cycle_map() -> list[dict]:
     return cycle_map
 
 
-# ─── step 3: load raw signals for one cycle ─────────────────────────────────
-def load_raw_signals(entry: dict) -> dict[str, np.ndarray] | None:
-    """Return a dict of channel_name -> 1-D numpy array for one cycle,
-    or None if a file is empty/corrupt."""
+def load_raw_signals(entry):
     signals = {}
 
     ft_path = FORCE_DIR / entry["force_file"]
@@ -196,11 +168,8 @@ def load_raw_signals(entry: dict) -> dict[str, np.ndarray] | None:
     return signals
 
 
-def detect_cutting_region(signals: dict[str, np.ndarray]) -> tuple[int, int]:
-    """Detect the active cutting region using Fz (axial force).
-
-    Computes a 1-second rolling RMS of Fz and marks regions where
-    it exceeds 5% of the peak RMS as active cutting."""
+def detect_cutting_region(signals):
+    """Use rolling RMS of Fz to find where cutting is actually happening."""
     fz = signals["Fz"]
     window = min(10000, len(fz) // 4)
     rms = np.sqrt(np.convolve(fz ** 2, np.ones(window) / window, mode="same"))
@@ -211,10 +180,7 @@ def detect_cutting_region(signals: dict[str, np.ndarray]) -> tuple[int, int]:
     return int(active[0]), int(active[-1]) + 1
 
 
-def extract_windowed_features(signals: dict[str, np.ndarray],
-                              num_windows: int) -> list[dict]:
-    """Trim to the active cutting region, then split into num_windows equal
-    segments and extract features from each window."""
+def extract_windowed_features(signals, num_windows):
     cut_start, cut_end = detect_cutting_region(signals)
     trimmed = {k: v[cut_start:cut_end] for k, v in signals.items()}
 
@@ -237,7 +203,6 @@ def extract_windowed_features(signals: dict[str, np.ndarray],
     return window_rows
 
 
-# ─── step 4 & 5: build dataset, split, and save ─────────────────────────────
 def main():
     print("Step 1: Loading tool wear labels...")
     vbmax = load_tool_wear()
@@ -279,7 +244,7 @@ def main():
                     if c not in ("cycle", "avg_vbmax", "window")]
     print(f"\n  Total samples: {len(df)}, features per sample: {len(feature_cols)}")
 
-    # ── 80/20 split at the CYCLE level to prevent data leakage ──
+    # 80/20 split at cycle level to prevent data leakage
     random.seed(RANDOM_SEED)
     unique_cycles = df["cycle"].unique().tolist()
     random.shuffle(unique_cycles)
@@ -290,7 +255,6 @@ def main():
     train_df = df[df["cycle"].isin(train_cycles)].reset_index(drop=True)
     test_df = df[df["cycle"].isin(test_cycles)].reset_index(drop=True)
 
-    # ── save ──
     train_dir = OUT_DIR / "train"
     test_dir = OUT_DIR / "test"
     train_dir.mkdir(parents=True, exist_ok=True)
