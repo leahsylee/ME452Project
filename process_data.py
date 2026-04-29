@@ -151,20 +151,6 @@ def load_raw_signals(entry):
     for col in ["Fx", "Fy", "Fz", "Mz"]:
         signals[col] = ft_df[col].values
 
-    vib_path = VIB_DIR / entry["vib_file"]
-    if vib_path.stat().st_size == 0:
-        return None
-    channel_names = ["accel_x", "accel_y", "accel_z", "sound"]
-    if vib_path.suffix == ".xlsx":
-        vib_data = read_xlsx_numeric_columns(vib_path)
-        for col_idx, name in enumerate(channel_names):
-            signals[name] = vib_data[:, col_idx]
-    else:
-        vib_df = pd.read_csv(vib_path, encoding="latin-1", on_bad_lines="skip")
-        for col_idx, name in enumerate(channel_names):
-            col_data = pd.to_numeric(vib_df.iloc[:, col_idx + 1], errors="coerce")
-            signals[name] = col_data.dropna().values
-
     return signals
 
 
